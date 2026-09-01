@@ -1,0 +1,902 @@
+// File: include/game_sim.hpp
+
+// Project: Deterministic Gameplay Ability & Event System
+// Completed: August 2026
+// Tools: Standard C++20 and GNU Make
+// Role: Gameplay systems programming, implementation, and testing
+//
+// A small combat simulation with queued events, cooldowns, and status effects.
+// Integer ticks and sequence numbers make event order repeatable.
+
+#pragma once
+
+#include <compare>
+#include <cstdint>
+#include <map>
+#include <optional>
+#include <ostream>
+#include <queue>
+#include <string>
+#include <string_view>
+#include <variant>
+#include <vector>
+
+namespace gamesim {
+
+using Tick = std::uint64_t;
+
+struct EntityId {
+    std::uint32_t value{};
+    auto operator<=>(const EntityId&) const = default;
+};
+
+std::ostream& operator<<(std::ostream& out, EntityId id);
+
+enum class Team {
+    Heroes,
+    Monsters,
+};
+
+enum class DamageType {
+    Physical,
+    Fire,
+    True,
+};
+
+enum class StackRule {
+    RefreshDuration,
+    AddStackAndRefresh,
+};
+
+std::string_view to_string(DamageType type);
+
+struct Stats {
+    int max_health{100};
+    int max_energy{20};
+    int armor{0};
+};
+
+struct EffectSpec {
+    std::string id;
+    Tick duration{};
+    std::optional<Tick> pulse_interval;
+    int periodic_damage{};
+    DamageType periodic_damage_type{DamageType::True};
+    int armor_delta{};
+    StackRule stack_rule{StackRule::RefreshDuration};
+    std::uint8_t max_stacks{1};
+    int potency{};
+
+    void validate() const;
+};
+
+struct ActiveEffect {
+    EffectSpec spec;
+    EntityId source;
+    Tick expires_at{};
+    std::optional<Tick> next_pulse;
+    std::uint8_t stacks{1};
+};
+
+struct Entity {
+    EntityId id;
+    std::string name;
+    Team team{Team::Heroes};
+    Stats base_stats;
+    int health{};
+    int energy{};
+    std::map<std::string, Tick, std::less<>> cooldown_ready_at;
+    std::map<std::string, ActiveEffect, std::less<>> effects;
+
+    [[nodiscard]] bool alive() const noexcept;
+    [[nodiscard]] int armor() const noexcept;
+    [[nodiscard]] Tick cooldown_remaining(std::string_view ability, Tick now) const;
+};
+
+struct DamageEvent {
+    EntityId source;
+    EntityId target;
+    int amount{};
+    DamageType type{DamageType::Physical};
+    std::string label;
+};
+
+struct HealEvent {
+    EntityId source;
+    EntityId target;
+    int amount{};
+    std::string label;
+};
+
+struct ApplyEffectEvent {
+    EntityId source;
+    EntityId target;
+    EffectSpec effect;
+};
+
+using EventPayload = std::variant<DamageEvent, HealEvent, ApplyEffectEvent>;
+
+struct ScheduledEvent {
+    Tick execute_at{};
+    std::uint64_t sequence{};
+    EventPayload payload;
+};
+
+struct EventLater {
+    bool operator()(const ScheduledEvent& left, const ScheduledEvent& right) const noexcept;
+};
+
+struct LogEntry {
+    Tick tick{};
+    std::string message;
+    auto operator<=>(const LogEntry&) const = default;
+};
+
+class World {
+public:
+    EntityId create_entity(std::string name, Team team, Stats stats);
+
+    [[nodiscard]] Tick now() const noexcept;
+    [[nodiscard]] bool contains(EntityId id) const noexcept;
+    [[nodiscard]] bool same_team(EntityId left, EntityId right) const;
+
+    Entity& get(EntityId id);
+    const Entity& get(EntityId id) const;
+
+    void schedule(Tick delay, EventPayload payload);
+    void advance(Tick ticks = 1);
+    void record(std::string message);
+
+    [[nodiscard]] const std::vector<LogEntry>& log() const noexcept;
+    [[nodiscard]] std::string snapshot() const;
+
+private:
+    void process_current_events();
+    void pulse_effects();
+    void expire_effects();
+    void apply(const DamageEvent& event);
+    void apply(const HealEvent& event);
+    void apply(const ApplyEffectEvent& event);
+
+    Tick now_{};
+    std::uint32_t next_entity_id_{1};
+    std::uint64_t next_sequence_{};
+    std::map<EntityId, Entity> entities_;
+    std::priority_queue<ScheduledEvent, std::vector<ScheduledEvent>, EventLater> events_;
+    std::vector<LogEntry> log_;
+};
+
+enum class CastError {
+    None,
+    UnknownEntity,
+    SourceDefeated,
+    TargetDefeated,
+    InvalidTarget,
+    InsufficientEnergy,
+    Cooldown,
+};
+
+struct CastResult {
+    CastError error{CastError::None};
+    Tick cooldown_remaining{};
+
+    [[nodiscard]] explicit operator bool() const noexcept;
+    static CastResult success();
+    static CastResult failure(CastError error, Tick remaining = 0);
+};
+
+enum class TargetPolicy {
+    Enemy,
+    Ally,
+};
+
+class Ability {
+public:
+    virtual ~Ability() = default;
+
+    [[nodiscard]] CastResult cast(World& world, EntityId source, EntityId target) const;
+
+protected:
+    Ability(std::string id,
+            std::string name,
+            int energy_cost,
+            Tick cooldown,
+            TargetPolicy target_policy);
+
+    virtual void enqueue(World& world, EntityId source, EntityId target) const = 0;
+
+private:
+    [[nodiscard]] bool valid_target(const World& world,
+                                    EntityId source,
+                                    EntityId target) const;
+
+    std::string id_;
+    std::string name_;
+    int energy_cost_{};
+    Tick cooldown_{};
+    TargetPolicy target_policy_{TargetPolicy::Enemy};
+};
+
+class EmberSlash final : public Ability {
+public:
+    EmberSlash();
+
+private:
+    void enqueue(World& world, EntityId source, EntityId target) const override;
+};
+
+class Mend final : public Ability {
+public:
+    Mend();
+
+private:
+    void enqueue(World& world, EntityId source, EntityId target) const override;
+};
+
+class Fortify final : public Ability {
+public:
+    Fortify();
+
+private:
+    void enqueue(World& world, EntityId source, EntityId target) const override;
+};
+
+}  // namespace gamesim
+
+// File: src/game_sim.cpp
+
+#include "game_sim.hpp"
+
+#include <algorithm>
+#include <sstream>
+#include <stdexcept>
+#include <utility>
+
+namespace gamesim {
+namespace {
+
+template <class... Visitors>
+struct Overloaded : Visitors... {
+    using Visitors::operator()...;
+};
+
+template <class... Visitors>
+Overloaded(Visitors...) -> Overloaded<Visitors...>;
+
+std::string stack_text(std::uint8_t stacks) {
+    return std::to_string(static_cast<unsigned int>(stacks)) +
+           (stacks == 1 ? " stack" : " stacks");
+}
+
+void restart_pulse_timer(ActiveEffect& effect, Tick now) {
+    effect.next_pulse = effect.spec.pulse_interval
+                            ? std::optional<Tick>{now + *effect.spec.pulse_interval}
+                            : std::nullopt;
+}
+
+}  // namespace
+
+std::ostream& operator<<(std::ostream& out, EntityId id) {
+    return out << id.value;
+}
+
+std::string_view to_string(DamageType type) {
+    switch (type) {
+        case DamageType::Physical:
+            return "physical";
+        case DamageType::Fire:
+            return "fire";
+        case DamageType::True:
+            return "true";
+    }
+    return "unknown";
+}
+
+void EffectSpec::validate() const {
+    if (id.empty()) {
+        throw std::invalid_argument("An effect must have a non-empty id.");
+    }
+    if (duration == 0) {
+        throw std::invalid_argument("An effect duration must be positive.");
+    }
+    if (max_stacks == 0) {
+        throw std::invalid_argument("An effect must allow at least one stack.");
+    }
+    if (pulse_interval && *pulse_interval == 0) {
+        throw std::invalid_argument("An effect pulse interval must be positive.");
+    }
+    if (periodic_damage != 0 && !pulse_interval) {
+        throw std::invalid_argument("Periodic damage requires a pulse interval.");
+    }
+}
+
+bool Entity::alive() const noexcept {
+    return health > 0;
+}
+
+int Entity::armor() const noexcept {
+    int total = base_stats.armor;
+    for (const auto& [effect_id, effect] : effects) {
+        static_cast<void>(effect_id);
+        total += effect.spec.armor_delta * static_cast<int>(effect.stacks);
+    }
+    return std::max(0, total);
+}
+
+Tick Entity::cooldown_remaining(std::string_view ability, Tick now) const {
+    const auto found = cooldown_ready_at.find(ability);
+    if (found == cooldown_ready_at.end() || found->second <= now) {
+        return 0;
+    }
+    return found->second - now;
+}
+
+bool EventLater::operator()(const ScheduledEvent& left,
+                            const ScheduledEvent& right) const noexcept {
+    if (left.execute_at != right.execute_at) {
+        return left.execute_at > right.execute_at;
+    }
+    return left.sequence > right.sequence;
+}
+
+EntityId World::create_entity(std::string name, Team team, Stats stats) {
+    if (name.empty()) {
+        throw std::invalid_argument("An entity must have a name.");
+    }
+    if (stats.max_health <= 0 || stats.max_energy < 0 || stats.armor < 0) {
+        throw std::invalid_argument("Entity stats are outside the valid range.");
+    }
+
+    const EntityId id{next_entity_id_++};
+    Entity entity{id,
+                  std::move(name),
+                  team,
+                  stats,
+                  stats.max_health,
+                  stats.max_energy,
+                  {},
+                  {}};
+    entities_.emplace(id, std::move(entity));
+    return id;
+}
+
+Tick World::now() const noexcept {
+    return now_;
+}
+
+bool World::contains(EntityId id) const noexcept {
+    return entities_.contains(id);
+}
+
+bool World::same_team(EntityId left, EntityId right) const {
+    return get(left).team == get(right).team;
+}
+
+Entity& World::get(EntityId id) {
+    const auto found = entities_.find(id);
+    if (found == entities_.end()) {
+        throw std::out_of_range("Unknown entity id: " + std::to_string(id.value));
+    }
+    return found->second;
+}
+
+const Entity& World::get(EntityId id) const {
+    const auto found = entities_.find(id);
+    if (found == entities_.end()) {
+        throw std::out_of_range("Unknown entity id: " + std::to_string(id.value));
+    }
+    return found->second;
+}
+
+void World::schedule(Tick delay, EventPayload payload) {
+    events_.push(ScheduledEvent{now_ + delay, next_sequence_++, std::move(payload)});
+}
+
+void World::advance(Tick ticks) {
+    for (Tick elapsed = 0; elapsed < ticks; ++elapsed) {
+        process_current_events();
+        pulse_effects();
+        process_current_events();
+        expire_effects();
+        ++now_;
+    }
+}
+
+void World::record(std::string message) {
+    log_.push_back(LogEntry{now_, std::move(message)});
+}
+
+const std::vector<LogEntry>& World::log() const noexcept {
+    return log_;
+}
+
+std::string World::snapshot() const {
+    std::ostringstream out;
+    out << "tick=" << now_;
+    for (const auto& [id, entity] : entities_) {
+        out << "|entity=" << id << ',' << entity.name << ",hp=" << entity.health
+            << ",energy=" << entity.energy << ",armor=" << entity.armor();
+
+        for (const auto& [ability, ready_at] : entity.cooldown_ready_at) {
+            out << ",cd(" << ability << ")=" << ready_at;
+        }
+        for (const auto& [effect_id, effect] : entity.effects) {
+            out << ",fx(" << effect_id << ")="
+                << static_cast<unsigned int>(effect.stacks) << '@' << effect.expires_at;
+        }
+    }
+    return out.str();
+}
+
+void World::process_current_events() {
+    while (!events_.empty() && events_.top().execute_at <= now_) {
+        ScheduledEvent event = events_.top();
+        events_.pop();
+        std::visit(Overloaded{
+                       [this](const DamageEvent& value) { apply(value); },
+                       [this](const HealEvent& value) { apply(value); },
+                       [this](const ApplyEffectEvent& value) { apply(value); },
+                   },
+                   event.payload);
+    }
+}
+
+void World::pulse_effects() {
+    for (auto& [entity_id, entity] : entities_) {
+        static_cast<void>(entity_id);
+        if (!entity.alive()) {
+            continue;
+        }
+
+        for (auto& [effect_id, effect] : entity.effects) {
+            static_cast<void>(effect_id);
+            if (!effect.next_pulse || now_ < *effect.next_pulse ||
+                now_ > effect.expires_at) {
+                continue;
+            }
+
+            const int amount = effect.spec.periodic_damage *
+                               static_cast<int>(effect.stacks);
+            if (amount > 0) {
+                schedule(0,
+                         DamageEvent{effect.source,
+                                     entity.id,
+                                     amount,
+                                     effect.spec.periodic_damage_type,
+                                     effect.spec.id});
+            }
+            *effect.next_pulse += *effect.spec.pulse_interval;
+        }
+    }
+}
+
+void World::expire_effects() {
+    for (auto& [entity_id, entity] : entities_) {
+        static_cast<void>(entity_id);
+        for (auto effect = entity.effects.begin(); effect != entity.effects.end();) {
+            if (now_ >= effect->second.expires_at) {
+                record(entity.name + " loses " + effect->first + ".");
+                effect = entity.effects.erase(effect);
+            } else {
+                ++effect;
+            }
+        }
+    }
+}
+
+void World::apply(const DamageEvent& event) {
+    if (!contains(event.target) || event.amount < 0) {
+        return;
+    }
+
+    Entity& target = get(event.target);
+    if (!target.alive()) {
+        return;
+    }
+
+    const int mitigation = event.type == DamageType::Physical ? target.armor() : 0;
+    const int resolved = std::max(0, event.amount - mitigation);
+    const int actual = std::min(target.health, resolved);
+    target.health -= actual;
+
+    const std::string source = contains(event.source) ? get(event.source).name : "Environment";
+    std::ostringstream message;
+    message << source << " deals " << actual << ' ' << to_string(event.type)
+            << " damage to " << target.name;
+    if (!event.label.empty()) {
+        message << " with " << event.label;
+    }
+    if (mitigation > 0) {
+        message << " (" << std::min(event.amount, mitigation) << " mitigated)";
+    }
+    message << '.';
+    record(message.str());
+
+    if (!target.alive()) {
+        record(target.name + " is defeated.");
+    }
+}
+
+void World::apply(const HealEvent& event) {
+    if (!contains(event.target) || event.amount < 0) {
+        return;
+    }
+
+    Entity& target = get(event.target);
+    if (!target.alive()) {
+        return;
+    }
+
+    const int missing = target.base_stats.max_health - target.health;
+    const int actual = std::min(missing, event.amount);
+    target.health += actual;
+
+    const std::string source = contains(event.source) ? get(event.source).name : "Environment";
+    std::ostringstream message;
+    message << source << " restores " << actual << " health to " << target.name;
+    if (!event.label.empty()) {
+        message << " with " << event.label;
+    }
+    message << '.';
+    record(message.str());
+}
+
+void World::apply(const ApplyEffectEvent& event) {
+    if (!contains(event.target)) {
+        return;
+    }
+    event.effect.validate();
+
+    Entity& target = get(event.target);
+    if (!target.alive()) {
+        return;
+    }
+
+    auto found = target.effects.find(event.effect.id);
+    if (found == target.effects.end()) {
+        ActiveEffect active{event.effect,
+                            event.source,
+                            now_ + event.effect.duration,
+                            std::nullopt,
+                            1};
+        restart_pulse_timer(active, now_);
+        target.effects.emplace(event.effect.id, std::move(active));
+        record(target.name + " gains " + event.effect.id + " (" + stack_text(1) + ").");
+        return;
+    }
+
+    ActiveEffect& active = found->second;
+    if (active.spec.stack_rule != event.effect.stack_rule) {
+        throw std::invalid_argument(
+            "An effect id cannot change its stacking rule while active.");
+    }
+
+    switch (active.spec.stack_rule) {
+        case StackRule::RefreshDuration:
+            active.expires_at = now_ + event.effect.duration;
+            active.source = event.source;
+            if (event.effect.potency >= active.spec.potency) {
+                active.spec = event.effect;
+                restart_pulse_timer(active, now_);
+            }
+            break;
+
+        case StackRule::AddStackAndRefresh:
+            active.expires_at = now_ + event.effect.duration;
+            active.source = event.source;
+            if (event.effect.potency > active.spec.potency) {
+                active.spec = event.effect;
+                restart_pulse_timer(active, now_);
+            }
+            active.stacks = static_cast<std::uint8_t>(
+                std::min<int>(active.spec.max_stacks, active.stacks + 1));
+            break;
+
+    }
+
+    record(target.name + " refreshes " + event.effect.id + " (" +
+           stack_text(active.stacks) + ").");
+}
+
+CastResult::operator bool() const noexcept {
+    return error == CastError::None;
+}
+
+CastResult CastResult::success() {
+    return {};
+}
+
+CastResult CastResult::failure(CastError error, Tick remaining) {
+    return CastResult{error, remaining};
+}
+
+Ability::Ability(std::string id,
+                 std::string name,
+                 int energy_cost,
+                 Tick cooldown,
+                 TargetPolicy target_policy)
+    : id_(std::move(id)),
+      name_(std::move(name)),
+      energy_cost_(energy_cost),
+      cooldown_(cooldown),
+      target_policy_(target_policy) {
+    if (id_.empty() || name_.empty() || energy_cost_ < 0) {
+        throw std::invalid_argument("Invalid ability configuration.");
+    }
+}
+
+CastResult Ability::cast(World& world, EntityId source_id, EntityId target_id) const {
+    if (!world.contains(source_id) || !world.contains(target_id)) {
+        return CastResult::failure(CastError::UnknownEntity);
+    }
+
+    Entity& source = world.get(source_id);
+    const Entity& target = world.get(target_id);
+    if (!source.alive()) {
+        return CastResult::failure(CastError::SourceDefeated);
+    }
+    if (!target.alive()) {
+        return CastResult::failure(CastError::TargetDefeated);
+    }
+    if (!valid_target(world, source_id, target_id)) {
+        return CastResult::failure(CastError::InvalidTarget);
+    }
+    if (source.energy < energy_cost_) {
+        return CastResult::failure(CastError::InsufficientEnergy);
+    }
+
+    const Tick remaining = source.cooldown_remaining(id_, world.now());
+    if (remaining > 0) {
+        return CastResult::failure(CastError::Cooldown, remaining);
+    }
+
+    source.energy -= energy_cost_;
+    source.cooldown_ready_at[id_] = world.now() + cooldown_;
+    world.record(source.name + " casts " + name_ + " on " + target.name + ".");
+    enqueue(world, source_id, target_id);
+    return CastResult::success();
+}
+
+bool Ability::valid_target(const World& world, EntityId source, EntityId target) const {
+    switch (target_policy_) {
+        case TargetPolicy::Enemy:
+            return !world.same_team(source, target);
+        case TargetPolicy::Ally:
+            return world.same_team(source, target);
+    }
+    return false;
+}
+
+EmberSlash::EmberSlash()
+    : Ability("ember_slash", "Ember Slash", 4, 3, TargetPolicy::Enemy) {}
+
+void EmberSlash::enqueue(World& world, EntityId source, EntityId target) const {
+    world.schedule(0, DamageEvent{source, target, 14, DamageType::Physical, "Ember Slash"});
+
+    EffectSpec burn;
+    burn.id = "Burn";
+    burn.duration = 4;
+    burn.pulse_interval = 1;
+    burn.periodic_damage = 3;
+    burn.periodic_damage_type = DamageType::Fire;
+    burn.stack_rule = StackRule::AddStackAndRefresh;
+    burn.max_stacks = 3;
+    burn.potency = 3;
+    world.schedule(0, ApplyEffectEvent{source, target, std::move(burn)});
+}
+
+Mend::Mend() : Ability("mend", "Mend", 5, 4, TargetPolicy::Ally) {}
+
+void Mend::enqueue(World& world, EntityId source, EntityId target) const {
+    world.schedule(0, HealEvent{source, target, 12, "Mend"});
+}
+
+Fortify::Fortify() : Ability("fortify", "Fortify", 3, 5, TargetPolicy::Ally) {}
+
+void Fortify::enqueue(World& world, EntityId source, EntityId target) const {
+    EffectSpec armor;
+    armor.id = "Fortify";
+    armor.duration = 3;
+    armor.armor_delta = 5;
+    armor.stack_rule = StackRule::RefreshDuration;
+    armor.max_stacks = 1;
+    armor.potency = 5;
+    world.schedule(0, ApplyEffectEvent{source, target, std::move(armor)});
+}
+
+}  // namespace gamesim
+
+// File: tests/tests.cpp
+
+#include "game_sim.hpp"
+
+#include <functional>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace {
+
+class TestFailure : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+#define CHECK_TRUE(condition)                                                        \
+    do {                                                                             \
+        if (!(condition)) {                                                          \
+            throw TestFailure(std::string("Check failed: ") + #condition +          \
+                              " at line " + std::to_string(__LINE__));               \
+        }                                                                            \
+    } while (false)
+
+#define CHECK_EQ(left, right)                                                        \
+    do {                                                                             \
+        const auto actual_value = (left);                                             \
+        const auto expected_value = (right);                                          \
+        if (!(actual_value == expected_value)) {                                      \
+            throw TestFailure(std::string("Equality check failed: ") + #left +       \
+                              " == " + #right + " at line " +                       \
+                              std::to_string(__LINE__));                              \
+        }                                                                            \
+    } while (false)
+
+using Test = std::pair<std::string, std::function<void()>>;
+using namespace gamesim;
+
+void test_cast_validation_and_cooldown() {
+    World world;
+    const EntityId hero = world.create_entity("Hero", Team::Heroes, Stats{100, 20, 2});
+    const EntityId ally = world.create_entity("Ally", Team::Heroes, Stats{100, 20, 1});
+    const EntityId enemy = world.create_entity("Enemy", Team::Monsters, Stats{200, 20, 2});
+    EmberSlash slash;
+    Mend mend;
+
+    const int starting_energy = world.get(hero).energy;
+    CHECK_EQ(slash.cast(world, EntityId{999}, enemy).error, CastError::UnknownEntity);
+    world.get(hero).energy = 3;
+    CHECK_EQ(slash.cast(world, hero, enemy).error, CastError::InsufficientEnergy);
+    world.get(hero).energy = starting_energy;
+    CHECK_EQ(slash.cast(world, hero, ally).error, CastError::InvalidTarget);
+    CHECK_EQ(mend.cast(world, hero, enemy).error, CastError::InvalidTarget);
+    CHECK_EQ(world.get(hero).energy, starting_energy);
+
+    CHECK_TRUE(slash.cast(world, hero, enemy));
+    const CastResult blocked = slash.cast(world, hero, enemy);
+    CHECK_EQ(blocked.error, CastError::Cooldown);
+    CHECK_EQ(blocked.cooldown_remaining, Tick{3});
+    CHECK_EQ(world.get(hero).energy, starting_energy - 4);
+
+    world.advance(3);
+    CHECK_TRUE(slash.cast(world, hero, enemy));
+    CHECK_EQ(world.get(hero).energy, starting_energy - 8);
+}
+
+void test_event_order_and_effect_expiration() {
+    World world;
+    const EntityId hero = world.create_entity("Hero", Team::Heroes, Stats{100, 20, 2});
+    const EntityId enemy = world.create_entity("Enemy", Team::Monsters, Stats{100, 20, 0});
+    Fortify fortify;
+
+    CHECK_TRUE(fortify.cast(world, hero, hero));
+    world.schedule(0, DamageEvent{enemy, hero, 10, DamageType::Physical, "Test Hit"});
+    world.advance(1);
+
+    CHECK_EQ(world.get(hero).health, 97);
+    CHECK_EQ(world.get(hero).armor(), 7);
+
+    world.advance(3);
+    CHECK_EQ(world.get(hero).armor(), 2);
+
+    world.schedule(0, DamageEvent{enemy, hero, 10, DamageType::Physical, "Test Hit"});
+    world.advance(1);
+    CHECK_EQ(world.get(hero).health, 89);
+}
+
+void test_periodic_effect_stacking() {
+    World world;
+    const EntityId hero = world.create_entity("Hero", Team::Heroes, Stats{100, 20, 2});
+    const EntityId enemy = world.create_entity("Enemy", Team::Monsters, Stats{200, 20, 2});
+    EmberSlash slash;
+
+    CHECK_TRUE(slash.cast(world, hero, enemy));
+    world.advance(3);
+    CHECK_EQ(world.get(enemy).health, 182);
+
+    CHECK_TRUE(slash.cast(world, hero, enemy));
+    world.advance(1);
+    CHECK_EQ(world.get(enemy).health, 164);
+    CHECK_EQ(world.get(enemy).effects.at("Burn").stacks, std::uint8_t{2});
+    CHECK_EQ(world.get(enemy).effects.at("Burn").expires_at, Tick{7});
+
+    world.advance(1);
+    CHECK_EQ(world.get(enemy).health, 158);
+
+    world.advance(1);
+    CHECK_TRUE(slash.cast(world, hero, enemy));
+    world.advance(1);
+    CHECK_EQ(world.get(enemy).effects.at("Burn").stacks, std::uint8_t{3});
+
+    world.advance(2);
+    CHECK_TRUE(slash.cast(world, hero, enemy));
+    world.advance(1);
+    CHECK_EQ(world.get(enemy).effects.at("Burn").stacks, std::uint8_t{3});
+
+    EffectSpec incompatible = world.get(enemy).effects.at("Burn").spec;
+    incompatible.stack_rule = StackRule::RefreshDuration;
+    world.schedule(0, ApplyEffectEvent{hero, enemy, std::move(incompatible)});
+    bool rejected = false;
+    try {
+        world.advance(1);
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    CHECK_TRUE(rejected);
+}
+
+std::pair<std::string, std::vector<LogEntry>> run_replay() {
+    World world;
+    const EntityId hero = world.create_entity("Hero", Team::Heroes, Stats{100, 30, 3});
+    const EntityId enemy = world.create_entity("Enemy", Team::Monsters, Stats{120, 20, 2});
+    EmberSlash slash;
+    Fortify fortify;
+
+    CHECK_TRUE(fortify.cast(world, hero, hero));
+    CHECK_TRUE(slash.cast(world, hero, enemy));
+    world.schedule(0, DamageEvent{enemy, hero, 11, DamageType::Physical, "Counter"});
+    world.advance(3);
+    CHECK_TRUE(slash.cast(world, hero, enemy));
+    world.advance(4);
+    return {world.snapshot(), world.log()};
+}
+
+void test_deterministic_replay() {
+    const auto first = run_replay();
+    const auto second = run_replay();
+    CHECK_EQ(first.first, second.first);
+    CHECK_EQ(first.second, second.second);
+}
+
+void test_healing_clamps_to_maximum() {
+    World world;
+    const EntityId hero = world.create_entity("Hero", Team::Heroes, Stats{50, 20, 0});
+    const EntityId enemy = world.create_entity("Enemy", Team::Monsters, Stats{50, 20, 0});
+    Mend mend;
+
+    world.schedule(0, DamageEvent{enemy, hero, 7, DamageType::True, "Test Damage"});
+    world.advance(1);
+    CHECK_EQ(world.get(hero).health, 43);
+
+    CHECK_TRUE(mend.cast(world, hero, hero));
+    world.advance(1);
+    CHECK_EQ(world.get(hero).health, 50);
+}
+
+}  // namespace
+
+int main() {
+    const std::vector<Test> tests{
+        {"cast validation and cooldown", test_cast_validation_and_cooldown},
+        {"event order and effect expiration", test_event_order_and_effect_expiration},
+        {"periodic effect stacking rules", test_periodic_effect_stacking},
+        {"deterministic replay", test_deterministic_replay},
+        {"healing clamps to maximum", test_healing_clamps_to_maximum},
+    };
+
+    std::size_t passed = 0;
+    for (const auto& [name, test] : tests) {
+        try {
+            test();
+            ++passed;
+            std::cout << "[PASS] " << name << '\n';
+        } catch (const std::exception& error) {
+            std::cerr << "[FAIL] " << name << ": " << error.what() << '\n';
+        }
+    }
+
+    std::cout << passed << '/' << tests.size() << " tests passed.\n";
+    return passed == tests.size() ? 0 : 1;
+}
+

@@ -1,0 +1,968 @@
+// File: include/block_runtime.hpp
+
+// Project: Code Quest Block Program Runtime
+// Completed: August 2026
+// Tools: Standard C++17 and GNU Make
+// Role: Gameplay systems programming, block-language runtime, and testing
+//
+// Compiles ordered player blocks into bytecode and executes them in a small
+// puzzle world while preserving source block IDs for interface feedback.
+
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+namespace codequest {
+
+using BlockId = std::uint32_t;
+
+struct Vec2 {
+    double x = 0.0;
+    double y = 0.0;
+};
+
+enum class BlockKind {
+    Move,
+    If,
+    Repeat,
+    OpenBrace,
+    CloseBrace
+};
+
+enum class Condition {
+    ThreatNearby,
+    CarryingKey,
+    DoorLocked
+};
+
+struct Block {
+    BlockId id = 0;
+    BlockKind kind = BlockKind::Move;
+    std::string destination;
+    Condition condition = Condition::ThreatNearby;
+    int repeat_count = 0;
+
+    static Block move(BlockId id, std::string destination);
+    static Block branch(BlockId id, Condition condition);
+    static Block repeat(BlockId id, int count);
+    static Block open_brace(BlockId id);
+    static Block close_brace(BlockId id);
+};
+
+enum class OpCode {
+    Move,
+    JumpIfFalse,
+    BeginRepeat,
+    EndRepeat,
+    Halt
+};
+
+struct Instruction {
+    OpCode code = OpCode::Halt;
+    BlockId source = 0;
+    std::string destination;
+    Condition condition = Condition::ThreatNearby;
+    int value = 0;
+    std::size_t jump = 0;
+};
+
+class Program {
+public:
+    Program() = default;
+    explicit Program(std::vector<Instruction> instructions);
+
+    const std::vector<Instruction>& instructions() const noexcept;
+
+private:
+    std::vector<Instruction> instructions_;
+};
+
+struct Diagnostic {
+    BlockId block = 0;
+    std::string message;
+};
+
+struct CompileResult {
+    std::optional<Program> program;
+    std::vector<Diagnostic> diagnostics;
+
+    explicit operator bool() const noexcept;
+};
+
+class Compiler {
+public:
+    CompileResult compile(
+        const std::vector<Block>& blocks,
+        const std::unordered_set<std::string>& destinations) const;
+};
+
+enum class ArrivalEffect {
+    None,
+    PickUpKey,
+    UnlockDoor,
+    Goal
+};
+
+struct Destination {
+    Vec2 position;
+    ArrivalEffect effect = ArrivalEffect::None;
+    bool beyond_door = false;
+};
+
+struct PatrolHazard {
+    Vec2 first;
+    Vec2 second;
+    double speed = 0.0;
+    double collision_radius = 0.0;
+    double vision_radius = 0.0;
+};
+
+enum class TravelState {
+    Moving,
+    Arrived,
+    Blocked,
+    Caught
+};
+
+class PuzzleWorld {
+public:
+    PuzzleWorld(Vec2 player_start,
+                double player_speed,
+                int available_keys = 0,
+                int locked_sections = 0);
+
+    void add_destination(std::string name, Destination destination);
+    void add_hazard(PatrolHazard hazard);
+
+    std::unordered_set<std::string> destination_names() const;
+    bool test(Condition condition) const;
+    void advance_hazards();
+    TravelState step_toward(std::string_view destination);
+
+    bool player_caught() const;
+    bool goal_reached() const noexcept;
+    int carried_keys() const noexcept;
+    int locked_sections() const noexcept;
+    Vec2 player_position() const noexcept;
+    const std::vector<std::string>& visit_history() const noexcept;
+
+private:
+    struct HazardState {
+        PatrolHazard path;
+        Vec2 position;
+        bool toward_second = true;
+    };
+
+    void apply_arrival(std::string_view name, const Destination& destination);
+
+    std::unordered_map<std::string, Destination> destinations_;
+    std::vector<HazardState> hazards_;
+    std::vector<std::string> visits_;
+    Vec2 player_;
+    double player_speed_ = 1.0;
+    int available_keys_ = 0;
+    int carried_keys_ = 0;
+    int locked_sections_ = 0;
+    bool goal_reached_ = false;
+    bool caught_ = false;
+};
+
+enum class RunState {
+    Ready,
+    Running,
+    Finished,
+    Failed
+};
+
+struct TickResult {
+    RunState state = RunState::Ready;
+    std::optional<BlockId> active_block;
+    std::string message;
+};
+
+class Runtime {
+public:
+    explicit Runtime(Program program);
+
+    TickResult tick(PuzzleWorld& world);
+    void reset();
+    RunState state() const noexcept;
+
+private:
+    struct LoopFrame {
+        std::size_t begin = 0;
+        int remaining = 0;
+    };
+
+    TickResult fail(std::optional<BlockId> block, std::string message);
+
+    Program program_;
+    std::size_t pc_ = 0;
+    std::vector<LoopFrame> loops_;
+    RunState state_ = RunState::Ready;
+};
+
+std::string_view to_string(Condition condition) noexcept;
+std::string_view to_string(RunState state) noexcept;
+
+} // namespace codequest
+
+// File: src/block_runtime.cpp
+
+#include "block_runtime.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <stdexcept>
+#include <utility>
+
+namespace codequest {
+namespace {
+
+constexpr int kMaxRepeatCount = 32;
+constexpr std::size_t kMaxNestingDepth = 12;
+constexpr double kEpsilon = 1.0e-9;
+
+double distance(Vec2 left, Vec2 right) {
+    const double dx = right.x - left.x;
+    const double dy = right.y - left.y;
+    return std::sqrt(dx * dx + dy * dy);
+}
+
+double distance_to_segment(Vec2 point, Vec2 start, Vec2 end) {
+    const double dx = end.x - start.x;
+    const double dy = end.y - start.y;
+    const double length_squared = dx * dx + dy * dy;
+    if (length_squared <= kEpsilon) {
+        return distance(point, start);
+    }
+
+    const double projection = ((point.x - start.x) * dx +
+                               (point.y - start.y) * dy) /
+                              length_squared;
+    const double t = std::clamp(projection, 0.0, 1.0);
+    return distance(point, {start.x + t * dx, start.y + t * dy});
+}
+
+Vec2 move_toward(Vec2 current, Vec2 target, double amount) {
+    const double remaining = distance(current, target);
+    if (remaining <= amount || remaining <= kEpsilon) {
+        return target;
+    }
+
+    const double scale = amount / remaining;
+    return {
+        current.x + (target.x - current.x) * scale,
+        current.y + (target.y - current.y) * scale
+    };
+}
+
+class Parser {
+public:
+    Parser(const std::vector<Block>& blocks,
+           const std::unordered_set<std::string>& destinations)
+        : blocks_(blocks), destinations_(destinations) {}
+
+    CompileResult run() {
+        if (!validate_ids()) {
+            return failure();
+        }
+
+        if (!parse_sequence(false, 0)) {
+            return failure();
+        }
+
+        if (move_count_ == 0) {
+            add_error(0, "program does not contain a movement block");
+            return failure();
+        }
+
+        code_.push_back(Instruction{});
+        CompileResult result;
+        result.program.emplace(std::move(code_));
+        return result;
+    }
+
+private:
+    bool validate_ids() {
+        std::unordered_set<BlockId> ids;
+        for (const Block& block : blocks_) {
+            if (block.id == 0) {
+                add_error(0, "block ids must be nonzero");
+                return false;
+            }
+            if (!ids.insert(block.id).second) {
+                add_error(block.id, "duplicate block id");
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool parse_sequence(bool inside_braces, std::size_t depth) {
+        if (depth > kMaxNestingDepth) {
+            add_error(blocks_[position_ - 1].id, "control blocks are nested too deeply");
+            return false;
+        }
+
+        while (position_ < blocks_.size()) {
+            const Block& block = blocks_[position_];
+
+            if (block.kind == BlockKind::CloseBrace) {
+                if (!inside_braces) {
+                    add_error(block.id, "closing brace has no matching control block");
+                    return false;
+                }
+                ++position_;
+                return true;
+            }
+
+            if (!parse_statement(depth)) {
+                return false;
+            }
+        }
+
+        if (inside_braces) {
+            add_error(blocks_.empty() ? 0 : blocks_.back().id,
+                      "control block is missing a closing brace");
+            return false;
+        }
+        return true;
+    }
+
+    bool parse_statement(std::size_t depth) {
+        const Block block = blocks_[position_++];
+
+        switch (block.kind) {
+        case BlockKind::Move:
+            if (block.destination.empty() ||
+                destinations_.find(block.destination) == destinations_.end()) {
+                add_error(block.id, "movement block names an unknown destination");
+                return false;
+            }
+            code_.push_back({OpCode::Move, block.id, block.destination});
+            ++move_count_;
+            return true;
+
+        case BlockKind::If: {
+            const std::size_t branch = code_.size();
+            Instruction instruction;
+            instruction.code = OpCode::JumpIfFalse;
+            instruction.source = block.id;
+            instruction.condition = block.condition;
+            code_.push_back(instruction);
+
+            if (!parse_body(block.id, depth + 1)) {
+                return false;
+            }
+            code_[branch].jump = code_.size();
+            return true;
+        }
+
+        case BlockKind::Repeat: {
+            if (block.repeat_count < 1 || block.repeat_count > kMaxRepeatCount) {
+                add_error(block.id, "repeat count must be between 1 and 32");
+                return false;
+            }
+
+            const std::size_t begin = code_.size();
+            Instruction instruction;
+            instruction.code = OpCode::BeginRepeat;
+            instruction.source = block.id;
+            instruction.value = block.repeat_count;
+            code_.push_back(instruction);
+
+            if (!parse_body(block.id, depth + 1)) {
+                return false;
+            }
+
+            Instruction end;
+            end.code = OpCode::EndRepeat;
+            end.source = block.id;
+            end.jump = begin;
+            code_.push_back(end);
+            code_[begin].jump = code_.size();
+            return true;
+        }
+
+        case BlockKind::OpenBrace:
+            add_error(block.id, "opening brace must follow an if or repeat block");
+            return false;
+
+        case BlockKind::CloseBrace:
+            add_error(block.id, "closing brace has no matching control block");
+            return false;
+        }
+        return false;
+    }
+
+    bool parse_body(BlockId owner, std::size_t depth) {
+        if (position_ >= blocks_.size() ||
+            blocks_[position_].kind != BlockKind::OpenBrace) {
+            add_error(owner, "control block must be followed by an opening brace");
+            return false;
+        }
+
+        ++position_;
+        return parse_sequence(true, depth);
+    }
+
+    void add_error(BlockId block, std::string message) {
+        diagnostics_.push_back({block, std::move(message)});
+    }
+
+    CompileResult failure() {
+        CompileResult result;
+        result.diagnostics = std::move(diagnostics_);
+        return result;
+    }
+
+    const std::vector<Block>& blocks_;
+    const std::unordered_set<std::string>& destinations_;
+    std::size_t position_ = 0;
+    std::size_t move_count_ = 0;
+    std::vector<Instruction> code_;
+    std::vector<Diagnostic> diagnostics_;
+};
+
+} // namespace
+
+Block Block::move(BlockId id, std::string destination) {
+    Block block;
+    block.id = id;
+    block.kind = BlockKind::Move;
+    block.destination = std::move(destination);
+    return block;
+}
+
+Block Block::branch(BlockId id, Condition condition) {
+    Block block;
+    block.id = id;
+    block.kind = BlockKind::If;
+    block.condition = condition;
+    return block;
+}
+
+Block Block::repeat(BlockId id, int count) {
+    Block block;
+    block.id = id;
+    block.kind = BlockKind::Repeat;
+    block.repeat_count = count;
+    return block;
+}
+
+Block Block::open_brace(BlockId id) {
+    Block block;
+    block.id = id;
+    block.kind = BlockKind::OpenBrace;
+    return block;
+}
+
+Block Block::close_brace(BlockId id) {
+    Block block;
+    block.id = id;
+    block.kind = BlockKind::CloseBrace;
+    return block;
+}
+
+Program::Program(std::vector<Instruction> instructions)
+    : instructions_(std::move(instructions)) {}
+
+const std::vector<Instruction>& Program::instructions() const noexcept {
+    return instructions_;
+}
+
+CompileResult::operator bool() const noexcept {
+    return program.has_value();
+}
+
+CompileResult Compiler::compile(
+    const std::vector<Block>& blocks,
+    const std::unordered_set<std::string>& destinations) const {
+    return Parser(blocks, destinations).run();
+}
+
+PuzzleWorld::PuzzleWorld(Vec2 player_start,
+                         double player_speed,
+                         int available_keys,
+                         int locked_sections)
+    : player_(player_start),
+      player_speed_(player_speed),
+      available_keys_(available_keys),
+      locked_sections_(locked_sections) {
+    if (player_speed <= 0.0) {
+        throw std::invalid_argument("player speed must be positive");
+    }
+    if (available_keys < 0 || locked_sections < 0) {
+        throw std::invalid_argument("key and lock counts cannot be negative");
+    }
+}
+
+void PuzzleWorld::add_destination(std::string name, Destination destination) {
+    if (name.empty()) {
+        throw std::invalid_argument("destination name cannot be empty");
+    }
+    if (!destinations_.emplace(std::move(name), destination).second) {
+        throw std::invalid_argument("destination already exists");
+    }
+}
+
+void PuzzleWorld::add_hazard(PatrolHazard hazard) {
+    if (hazard.speed < 0.0 || hazard.collision_radius < 0.0 ||
+        hazard.vision_radius < hazard.collision_radius) {
+        throw std::invalid_argument("invalid hazard settings");
+    }
+    hazards_.push_back({hazard, hazard.first, true});
+}
+
+std::unordered_set<std::string> PuzzleWorld::destination_names() const {
+    std::unordered_set<std::string> names;
+    for (const auto& entry : destinations_) {
+        names.insert(entry.first);
+    }
+    return names;
+}
+
+bool PuzzleWorld::test(Condition condition) const {
+    switch (condition) {
+    case Condition::ThreatNearby:
+        return std::any_of(hazards_.begin(), hazards_.end(), [this](const HazardState& hazard) {
+            return distance(player_, hazard.position) <= hazard.path.vision_radius;
+        });
+    case Condition::CarryingKey:
+        return carried_keys_ > 0;
+    case Condition::DoorLocked:
+        return locked_sections_ > 0;
+    }
+    return false;
+}
+
+void PuzzleWorld::advance_hazards() {
+    caught_ = false;
+    for (HazardState& hazard : hazards_) {
+        const Vec2 previous = hazard.position;
+        if (hazard.path.speed > 0.0 &&
+            distance(hazard.path.first, hazard.path.second) > kEpsilon) {
+            const Vec2 target = hazard.toward_second
+                                    ? hazard.path.second
+                                    : hazard.path.first;
+            hazard.position = move_toward(hazard.position, target, hazard.path.speed);
+            if (distance(hazard.position, target) <= kEpsilon ||
+                distance(previous, hazard.position) <= kEpsilon) {
+                hazard.toward_second = !hazard.toward_second;
+            }
+        }
+
+        if (distance_to_segment(player_, previous, hazard.position) <=
+            hazard.path.collision_radius) {
+            caught_ = true;
+        }
+    }
+}
+
+TravelState PuzzleWorld::step_toward(std::string_view destination_name) {
+    const auto found = destinations_.find(std::string(destination_name));
+    if (found == destinations_.end()) {
+        return TravelState::Blocked;
+    }
+
+    const Destination& destination = found->second;
+    if (destination.beyond_door && locked_sections_ > 0) {
+        return TravelState::Blocked;
+    }
+
+    const Vec2 previous = player_;
+    const double remaining = distance(previous, destination.position);
+    player_ = move_toward(player_, destination.position, player_speed_);
+
+    if (std::any_of(hazards_.begin(), hazards_.end(),
+                    [previous, this](const HazardState& hazard) {
+                        return distance_to_segment(hazard.position, previous, player_) <=
+                               hazard.path.collision_radius;
+                    })) {
+        caught_ = true;
+    }
+
+    if (player_caught()) {
+        return TravelState::Caught;
+    }
+
+    if (remaining > player_speed_ &&
+        distance(player_, destination.position) > kEpsilon) {
+        return TravelState::Moving;
+    }
+
+    apply_arrival(destination_name, destination);
+    return TravelState::Arrived;
+}
+
+bool PuzzleWorld::player_caught() const {
+    return caught_ ||
+           std::any_of(hazards_.begin(), hazards_.end(),
+                       [this](const HazardState& hazard) {
+                           return distance(player_, hazard.position) <=
+                                  hazard.path.collision_radius;
+                       });
+}
+
+bool PuzzleWorld::goal_reached() const noexcept {
+    return goal_reached_;
+}
+
+int PuzzleWorld::carried_keys() const noexcept {
+    return carried_keys_;
+}
+
+int PuzzleWorld::locked_sections() const noexcept {
+    return locked_sections_;
+}
+
+Vec2 PuzzleWorld::player_position() const noexcept {
+    return player_;
+}
+
+const std::vector<std::string>& PuzzleWorld::visit_history() const noexcept {
+    return visits_;
+}
+
+void PuzzleWorld::apply_arrival(std::string_view name,
+                                const Destination& destination) {
+    visits_.emplace_back(name);
+
+    switch (destination.effect) {
+    case ArrivalEffect::None:
+        break;
+    case ArrivalEffect::PickUpKey:
+        if (available_keys_ > 0 && carried_keys_ == 0) {
+            --available_keys_;
+            ++carried_keys_;
+        }
+        break;
+    case ArrivalEffect::UnlockDoor:
+        if (carried_keys_ > 0 && locked_sections_ > 0) {
+            --carried_keys_;
+            --locked_sections_;
+        }
+        break;
+    case ArrivalEffect::Goal:
+        goal_reached_ = true;
+        break;
+    }
+}
+
+Runtime::Runtime(Program program) : program_(std::move(program)) {}
+
+TickResult Runtime::tick(PuzzleWorld& world) {
+    if (state_ == RunState::Finished || state_ == RunState::Failed) {
+        return {state_, std::nullopt, "runtime has already stopped"};
+    }
+
+    state_ = RunState::Running;
+    world.advance_hazards();
+    if (world.player_caught()) {
+        return fail(std::nullopt, "player was caught before the next block executed");
+    }
+
+    const auto& code = program_.instructions();
+    if (pc_ >= code.size()) {
+        return fail(std::nullopt, "program counter left the compiled program");
+    }
+
+    const Instruction& instruction = code[pc_];
+    const std::optional<BlockId> source = instruction.source == 0
+                                              ? std::nullopt
+                                              : std::optional<BlockId>(instruction.source);
+
+    switch (instruction.code) {
+    case OpCode::Move: {
+        const TravelState travel = world.step_toward(instruction.destination);
+        if (travel == TravelState::Moving) {
+            return {state_, source, "moving to " + instruction.destination};
+        }
+        if (travel == TravelState::Arrived) {
+            ++pc_;
+            return {state_, source, "arrived at " + instruction.destination};
+        }
+        if (travel == TravelState::Caught) {
+            return fail(source, "player was caught while moving to " + instruction.destination);
+        }
+        return fail(source, "path to " + instruction.destination + " is blocked");
+    }
+
+    case OpCode::JumpIfFalse: {
+        const bool passed = world.test(instruction.condition);
+        pc_ = passed ? pc_ + 1 : instruction.jump;
+        return {state_, source,
+                std::string(to_string(instruction.condition)) +
+                    (passed ? " is true" : " is false")};
+    }
+
+    case OpCode::BeginRepeat:
+        loops_.push_back({pc_, instruction.value});
+        ++pc_;
+        return {state_, source, "repeat started"};
+
+    case OpCode::EndRepeat:
+        if (loops_.empty() || loops_.back().begin != instruction.jump) {
+            return fail(source, "repeat stack does not match compiled program");
+        }
+        if (loops_.back().remaining > 1) {
+            --loops_.back().remaining;
+            pc_ = loops_.back().begin + 1;
+            return {state_, source, "repeat continued"};
+        }
+        loops_.pop_back();
+        ++pc_;
+        return {state_, source, "repeat finished"};
+
+    case OpCode::Halt:
+        if (!loops_.empty()) {
+            return fail(source, "program ended with an active repeat block");
+        }
+        if (!world.goal_reached()) {
+            return fail(source, "program ended before the goal was reached");
+        }
+        state_ = RunState::Finished;
+        return {state_, std::nullopt, "goal reached"};
+    }
+
+    return fail(source, "unknown instruction");
+}
+
+void Runtime::reset() {
+    pc_ = 0;
+    loops_.clear();
+    state_ = RunState::Ready;
+}
+
+RunState Runtime::state() const noexcept {
+    return state_;
+}
+
+TickResult Runtime::fail(std::optional<BlockId> block, std::string message) {
+    state_ = RunState::Failed;
+    return {state_, block, std::move(message)};
+}
+
+std::string_view to_string(Condition condition) noexcept {
+    switch (condition) {
+    case Condition::ThreatNearby:
+        return "threat nearby";
+    case Condition::CarryingKey:
+        return "carrying key";
+    case Condition::DoorLocked:
+        return "door locked";
+    }
+    return "unknown condition";
+}
+
+std::string_view to_string(RunState state) noexcept {
+    switch (state) {
+    case RunState::Ready:
+        return "ready";
+    case RunState::Running:
+        return "running";
+    case RunState::Finished:
+        return "finished";
+    case RunState::Failed:
+        return "failed";
+    }
+    return "unknown";
+}
+
+} // namespace codequest
+
+// File: tests/tests.cpp
+
+#include "block_runtime.hpp"
+
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+using namespace codequest;
+
+namespace {
+
+class TestFailure : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+void check(bool condition, const std::string& message) {
+    if (!condition) {
+        throw TestFailure(message);
+    }
+}
+
+std::vector<TickResult> drive(Runtime& runtime, PuzzleWorld& world) {
+    std::vector<TickResult> trace;
+    for (int i = 0; i < 500; ++i) {
+        trace.push_back(runtime.tick(world));
+        if (trace.back().state == RunState::Finished ||
+            trace.back().state == RunState::Failed) {
+            return trace;
+        }
+    }
+    throw TestFailure("runtime did not stop within the tick budget");
+}
+
+Program compile_or_fail(const std::vector<Block>& blocks,
+                        const PuzzleWorld& world) {
+    CompileResult result = Compiler{}.compile(blocks, world.destination_names());
+    check(static_cast<bool>(result),
+          result.diagnostics.empty() ? "compile failed" : result.diagnostics.front().message);
+    return std::move(*result.program);
+}
+
+void test_compiler_builds_nested_control_flow() {
+    PuzzleWorld world({0, 0}, 1.0);
+    world.add_destination("A", {{0, 0}});
+    world.add_destination("B", {{3, 0}});
+    world.add_destination("C", {{6, 0}, ArrivalEffect::Goal});
+
+    const std::vector<Block> blocks = {
+        Block::repeat(1, 2),
+        Block::open_brace(2),
+        Block::move(3, "B"),
+        Block::branch(4, Condition::DoorLocked),
+        Block::open_brace(5),
+        Block::move(6, "A"),
+        Block::close_brace(7),
+        Block::close_brace(8),
+        Block::move(9, "C")
+    };
+
+    CompileResult result = Compiler{}.compile(blocks, world.destination_names());
+    check(static_cast<bool>(result), "valid nested program was rejected");
+
+    const auto& code = result.program->instructions();
+    check(code.size() == 7, "unexpected bytecode size");
+    check(code[0].code == OpCode::BeginRepeat && code[0].jump == 5,
+          "repeat jump was not patched correctly");
+    check(code[2].code == OpCode::JumpIfFalse && code[2].jump == 4,
+          "conditional jump was not patched correctly");
+    check(code[4].code == OpCode::EndRepeat && code[4].jump == 0,
+          "repeat back edge is incorrect");
+}
+
+void test_compiler_reports_block_errors() {
+    const std::unordered_set<std::string> destinations = {"A"};
+
+    CompileResult unknown = Compiler{}.compile(
+        {Block::move(7, "missing")}, destinations);
+    check(!unknown && unknown.diagnostics.front().block == 7,
+          "unknown destination did not identify its source block");
+
+    CompileResult brace = Compiler{}.compile(
+        {Block::repeat(1, 2), Block::open_brace(2), Block::move(3, "A")},
+        destinations);
+    check(!brace && brace.diagnostics.front().block == 3,
+          "missing closing brace was not reported");
+
+    CompileResult duplicate = Compiler{}.compile(
+        {Block::move(4, "A"), Block::move(4, "A")}, destinations);
+    check(!duplicate && duplicate.diagnostics.front().block == 4,
+          "duplicate block ids were accepted");
+}
+
+void test_repeat_program_opens_the_door() {
+    PuzzleWorld world({0, 0}, 1.0, 2, 2);
+    world.add_destination("A", {{0, 0}, ArrivalEffect::UnlockDoor});
+    world.add_destination("B", {{3, 0}, ArrivalEffect::PickUpKey});
+    world.add_destination("C", {{6, 0}, ArrivalEffect::Goal, true});
+
+    const std::vector<Block> blocks = {
+        Block::repeat(1, 2), Block::open_brace(2),
+        Block::move(3, "B"), Block::move(4, "A"),
+        Block::close_brace(5), Block::move(6, "C")
+    };
+
+    Runtime runtime(compile_or_fail(blocks, world));
+    const std::vector<TickResult> trace = drive(runtime, world);
+
+    check(trace.back().state == RunState::Finished, "valid solution did not finish");
+    check(world.locked_sections() == 0 && world.carried_keys() == 0,
+          "key and lock state is incorrect");
+    check(world.visit_history() == std::vector<std::string>({"B", "A", "B", "A", "C"}),
+          "repeat body executed in the wrong order");
+
+    std::vector<BlockId> arrivals;
+    for (const TickResult& tick : trace) {
+        if (tick.active_block && tick.message.rfind("arrived", 0) == 0) {
+            arrivals.push_back(*tick.active_block);
+        }
+    }
+    check(arrivals == std::vector<BlockId>({3, 4, 3, 4, 6}),
+          "runtime lost the source block mapping");
+}
+
+void test_condition_redirects_around_a_threat() {
+    const std::vector<Block> blocks = {
+        Block::branch(1, Condition::ThreatNearby), Block::open_brace(2),
+        Block::move(3, "H"), Block::close_brace(4), Block::move(5, "G")
+    };
+
+    PuzzleWorld danger({0, 0}, 1.0);
+    danger.add_destination("H", {{0, 3}});
+    danger.add_destination("G", {{4, 0}, ArrivalEffect::Goal});
+    danger.add_hazard({{2, 0}, {2, 0}, 0.0, 0.25, 3.0});
+    Runtime redirected(compile_or_fail(blocks, danger));
+    check(drive(redirected, danger).back().state == RunState::Finished,
+          "redirected route did not reach the goal");
+    check(danger.visit_history() == std::vector<std::string>({"H", "G"}),
+          "true condition did not execute its body");
+
+    PuzzleWorld safe({0, 0}, 1.0);
+    safe.add_destination("H", {{0, 3}});
+    safe.add_destination("G", {{4, 0}, ArrivalEffect::Goal});
+    Runtime direct(compile_or_fail(blocks, safe));
+    check(drive(direct, safe).back().state == RunState::Finished,
+          "direct route did not reach the goal");
+    check(safe.visit_history() == std::vector<std::string>({"G"}),
+          "false condition did not skip its body");
+}
+
+void test_collision_stops_execution() {
+    PuzzleWorld world({0, 0}, 4.0);
+    world.add_destination("G", {{4, 0}, ArrivalEffect::Goal});
+    world.add_hazard({{2, 0}, {2, 0}, 0.0, 0.35, 2.0});
+
+    Runtime runtime(compile_or_fail({Block::move(11, "G")}, world));
+    const std::vector<TickResult> trace = drive(runtime, world);
+    check(trace.back().state == RunState::Failed,
+          "collision along a movement segment did not stop the program");
+    check(trace.back().active_block == 11, "collision lost the active block id");
+}
+
+} // namespace
+
+int main() {
+    const std::vector<std::pair<std::string, void (*)()>> tests = {
+        {"compiler builds nested control flow", test_compiler_builds_nested_control_flow},
+        {"compiler reports block errors", test_compiler_reports_block_errors},
+        {"repeat program opens the door", test_repeat_program_opens_the_door},
+        {"condition redirects around a threat", test_condition_redirects_around_a_threat},
+        {"collision stops execution", test_collision_stops_execution}
+    };
+
+    for (const auto& test : tests) {
+        try {
+            test.second();
+            std::cout << "[PASS] " << test.first << '\n';
+        } catch (const std::exception& error) {
+            std::cerr << "[FAIL] " << test.first << ": " << error.what() << '\n';
+            return 1;
+        }
+    }
+    return 0;
+}
+
