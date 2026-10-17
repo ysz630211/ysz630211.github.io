@@ -248,12 +248,25 @@ private:
 #include "game_sim.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
 
 namespace gamesim {
 namespace {
+
+Tick checked_tick_add(Tick base, Tick delta) {
+    if (delta > std::numeric_limits<Tick>::max() - base) {
+        throw std::overflow_error("Simulation time is outside the supported range.");
+    }
+    return base + delta;
+}
+
+int bounded_amount(std::int64_t value) noexcept {
+    return static_cast<int>(std::clamp<std::int64_t>(
+        value, 0, std::numeric_limits<int>::max()));
+}
 
 template <class... Visitors>
 struct Overloaded : Visitors... {
@@ -269,7 +282,8 @@ std::string stack_text(std::uint8_t stacks) {
 }
 
 void restart_pulse_timer(ActiveEffect& effect, Tick now) {
-    effect.next_pulse = effect.spec.pulse_interval
+    effect.next_pulse = effect.spec.pulse_interval &&
+                                *effect.spec.pulse_interval <= effect.expires_at - now
                             ? std::optional<Tick>{now + *effect.spec.pulse_interval}
                             : std::nullopt;
 }
@@ -308,6 +322,9 @@ void EffectSpec::validate() const {
     if (periodic_damage != 0 && !pulse_interval) {
         throw std::invalid_argument("Periodic damage requires a pulse interval.");
     }
+    if (periodic_damage < 0) {
+        throw std::invalid_argument("Periodic damage cannot be negative.");
+    }
 }
 
 bool Entity::alive() const noexcept {
@@ -315,12 +332,12 @@ bool Entity::alive() const noexcept {
 }
 
 int Entity::armor() const noexcept {
-    int total = base_stats.armor;
+    std::int64_t total = base_stats.armor;
     for (const auto& [effect_id, effect] : effects) {
         static_cast<void>(effect_id);
-        total += effect.spec.armor_delta * static_cast<int>(effect.stacks);
+        total += static_cast<std::int64_t>(effect.spec.armor_delta) * effect.stacks;
     }
-    return std::max(0, total);
+    return bounded_amount(total);
 }
 
 Tick Entity::cooldown_remaining(std::string_view ability, Tick now) const {
@@ -389,10 +406,20 @@ const Entity& World::get(EntityId id) const {
 }
 
 void World::schedule(Tick delay, EventPayload payload) {
-    events_.push(ScheduledEvent{now_ + delay, next_sequence_++, std::move(payload)});
+    const Tick execute_at = checked_tick_add(now_, delay);
+    if (const auto* effect = std::get_if<ApplyEffectEvent>(&payload)) {
+        effect->effect.validate();
+        static_cast<void>(checked_tick_add(execute_at, effect->effect.duration));
+    }
+    if (next_sequence_ == std::numeric_limits<std::uint64_t>::max()) {
+        throw std::overflow_error("The event sequence counter is exhausted.");
+    }
+    events_.push(ScheduledEvent{execute_at, next_sequence_, std::move(payload)});
+    ++next_sequence_;
 }
 
 void World::advance(Tick ticks) {
+    static_cast<void>(checked_tick_add(now_, ticks));
     for (Tick elapsed = 0; elapsed < ticks; ++elapsed) {
         process_current_events();
         pulse_effects();
@@ -455,8 +482,8 @@ void World::pulse_effects() {
                 continue;
             }
 
-            const int amount = effect.spec.periodic_damage *
-                               static_cast<int>(effect.stacks);
+            const int amount = bounded_amount(
+                static_cast<std::int64_t>(effect.spec.periodic_damage) * effect.stacks);
             if (amount > 0) {
                 schedule(0,
                          DamageEvent{effect.source,
@@ -465,7 +492,11 @@ void World::pulse_effects() {
                                      effect.spec.periodic_damage_type,
                                      effect.spec.id});
             }
-            *effect.next_pulse += *effect.spec.pulse_interval;
+            if (*effect.spec.pulse_interval <= effect.expires_at - *effect.next_pulse) {
+                *effect.next_pulse += *effect.spec.pulse_interval;
+            } else {
+                effect.next_pulse.reset();
+            }
         }
     }
 }
@@ -552,11 +583,12 @@ void World::apply(const ApplyEffectEvent& event) {
         return;
     }
 
+    const Tick expires_at = checked_tick_add(now_, event.effect.duration);
     auto found = target.effects.find(event.effect.id);
     if (found == target.effects.end()) {
         ActiveEffect active{event.effect,
                             event.source,
-                            now_ + event.effect.duration,
+                            expires_at,
                             std::nullopt,
                             1};
         restart_pulse_timer(active, now_);
@@ -573,7 +605,7 @@ void World::apply(const ApplyEffectEvent& event) {
 
     switch (active.spec.stack_rule) {
         case StackRule::RefreshDuration:
-            active.expires_at = now_ + event.effect.duration;
+            active.expires_at = expires_at;
             active.source = event.source;
             if (event.effect.potency >= active.spec.potency) {
                 active.spec = event.effect;
@@ -582,7 +614,7 @@ void World::apply(const ApplyEffectEvent& event) {
             break;
 
         case StackRule::AddStackAndRefresh:
-            active.expires_at = now_ + event.effect.duration;
+            active.expires_at = expires_at;
             active.source = event.source;
             if (event.effect.potency > active.spec.potency) {
                 active.spec = event.effect;
@@ -650,8 +682,9 @@ CastResult Ability::cast(World& world, EntityId source_id, EntityId target_id) c
         return CastResult::failure(CastError::Cooldown, remaining);
     }
 
+    const Tick ready_at = checked_tick_add(world.now(), cooldown_);
     source.energy -= energy_cost_;
-    source.cooldown_ready_at[id_] = world.now() + cooldown_;
+    source.cooldown_ready_at[id_] = ready_at;
     world.record(source.name + " casts " + name_ + " on " + target.name + ".");
     enqueue(world, source_id, target_id);
     return CastResult::success();
