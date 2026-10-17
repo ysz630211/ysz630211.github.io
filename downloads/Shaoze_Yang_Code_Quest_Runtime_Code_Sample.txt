@@ -230,10 +230,14 @@ constexpr int kMaxRepeatCount = 32;
 constexpr std::size_t kMaxNestingDepth = 12;
 constexpr double kEpsilon = 1.0e-9;
 
+bool finite(Vec2 point) noexcept {
+    return std::isfinite(point.x) && std::isfinite(point.y);
+}
+
 double distance(Vec2 left, Vec2 right) {
     const double dx = right.x - left.x;
     const double dy = right.y - left.y;
-    return std::sqrt(dx * dx + dy * dy);
+    return std::hypot(dx, dy);
 }
 
 double distance_to_segment(Vec2 point, Vec2 start, Vec2 end) {
@@ -497,8 +501,8 @@ PuzzleWorld::PuzzleWorld(Vec2 player_start,
       player_speed_(player_speed),
       available_keys_(available_keys),
       locked_sections_(locked_sections) {
-    if (player_speed <= 0.0) {
-        throw std::invalid_argument("player speed must be positive");
+    if (!finite(player_start) || !std::isfinite(player_speed) || player_speed <= 0.0) {
+        throw std::invalid_argument("player position and positive speed must be finite");
     }
     if (available_keys < 0 || locked_sections < 0) {
         throw std::invalid_argument("key and lock counts cannot be negative");
@@ -509,13 +513,19 @@ void PuzzleWorld::add_destination(std::string name, Destination destination) {
     if (name.empty()) {
         throw std::invalid_argument("destination name cannot be empty");
     }
+    if (!finite(destination.position)) {
+        throw std::invalid_argument("destination position must be finite");
+    }
     if (!destinations_.emplace(std::move(name), destination).second) {
         throw std::invalid_argument("destination already exists");
     }
 }
 
 void PuzzleWorld::add_hazard(PatrolHazard hazard) {
-    if (hazard.speed < 0.0 || hazard.collision_radius < 0.0 ||
+    if (!finite(hazard.first) || !finite(hazard.second) ||
+        !std::isfinite(hazard.speed) || !std::isfinite(hazard.collision_radius) ||
+        !std::isfinite(hazard.vision_radius) ||
+        hazard.speed < 0.0 || hazard.collision_radius < 0.0 ||
         hazard.vision_radius < hazard.collision_radius) {
         throw std::invalid_argument("invalid hazard settings");
     }
